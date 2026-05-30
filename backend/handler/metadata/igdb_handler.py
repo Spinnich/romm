@@ -117,6 +117,46 @@ class IGDBRom(BaseRom):
     igdb_metadata: NotRequired[IGDBMetadata]
 
 
+def _sanitize_igdb_search_term(term: str) -> str:
+    """Strip characters that would break an APIcalypse string literal.
+
+    The search term is interpolated into IGDB ``search "..."`` and
+    ``name ~ *"..."*`` clauses. Dashes and colons are intentionally kept so the
+    wildcard query can still match punctuated alternative names; only the
+    double-quote and backslash — which would terminate or escape the quoted
+    string — are removed.
+    """
+    return term.replace("\\", "").replace('"', "")
+
+
+def _index_games_by_name(games: list[Game]) -> dict[str, Game]:
+    """Index each game under every title IGDB knows for it.
+
+    A game is keyed by its primary name plus each ``alternative_names`` and
+    ``game_localizations`` entry, so ``find_best_match`` can score a localized
+    filename against whichever title it actually uses. On a name collision the
+    lower IGDB id wins, keeping selection deterministic regardless of API
+    response order.
+    """
+    games_by_name: dict[str, Game] = {}
+    for game in games:
+        names: list[str] = []
+        primary = game.get("name", "")
+        if primary:
+            names.append(primary)
+        for alt in game.get("alternative_names", []):
+            if isinstance(alt, dict) and (alt_name := alt.get("name")):
+                names.append(alt_name)
+        for loc in game.get("game_localizations", []):
+            if isinstance(loc, dict) and (loc_name := loc.get("name")):
+                names.append(loc_name)
+        for name in names:
+            existing = games_by_name.get(name)
+            if existing is None or game["id"] < existing["id"]:
+                games_by_name[name] = game
+    return games_by_name
+
+
 def build_related_game(
     handler: MetadataHandler, rom: Game, game_type: str
 ) -> IGDBRelatedGame:
@@ -455,6 +495,11 @@ class IGDBHandler(MetadataHandler):
         if not platform_igdb_id:
             return None
 
+        # The caller may pass a term with punctuation preserved (to match
+        # punctuated alternative names), so drop the characters that would
+        # otherwise break the APIcalypse query.
+        search_term = _sanitize_igdb_search_term(search_term)
+
         if with_game_type:
             categories = (
                 GameType.EXPANDED_GAME,
@@ -484,21 +529,7 @@ class IGDBHandler(MetadataHandler):
             limit=self.pagination_limit,
         )
 
-        games_by_name: dict[str, Game] = {}
-        for game in roms:
-            candidate_names: list[str] = []
-            primary = game.get("name", "")
-            if primary:
-                candidate_names.append(primary)
-            for alt in game.get("alternative_names", []):
-                if isinstance(alt, dict) and (alt_name := alt.get("name")):
-                    candidate_names.append(alt_name)
-            for loc in game.get("game_localizations", []):
-                if isinstance(loc, dict) and (loc_name := loc.get("name")):
-                    candidate_names.append(loc_name)
-            for name in candidate_names:
-                if name not in games_by_name:
-                    games_by_name[name] = game
+        games_by_name = _index_games_by_name(roms)
 
         best_match, best_score = self.find_best_match(
             search_term,
@@ -540,24 +571,7 @@ class IGDBHandler(MetadataHandler):
                 limit=self.pagination_limit,
             )
 
-            extra_games_by_name: dict[str, Game] = {}
-            for game in extra_roms:
-                # Index the game under its primary name and every alternative /
-                # localized name so find_best_match can score against whichever
-                # title the filename actually uses.
-                extra_candidate_names: list[str] = []
-                primary = game.get("name", "")
-                if primary:
-                    extra_candidate_names.append(primary)
-                for alt in game.get("alternative_names", []):
-                    if isinstance(alt, dict) and (alt_name := alt.get("name")):
-                        extra_candidate_names.append(alt_name)
-                for loc in game.get("game_localizations", []):
-                    if isinstance(loc, dict) and (loc_name := loc.get("name")):
-                        extra_candidate_names.append(loc_name)
-                for name in extra_candidate_names:
-                    if name not in extra_games_by_name:
-                        extra_games_by_name[name] = game
+            extra_games_by_name = _index_games_by_name(extra_roms)
 
             best_match, best_score = self.find_best_match(
                 search_term,
@@ -763,6 +777,8 @@ class IGDBHandler(MetadataHandler):
 
         if not platform_igdb_id:
             return []
+
+        search_term = _sanitize_igdb_search_term(search_term)
 
         matched_roms = await self.igdb_service.list_games(
             search_term=search_term,

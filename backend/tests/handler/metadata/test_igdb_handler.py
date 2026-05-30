@@ -6,6 +6,7 @@ import pytest
 
 from adapters.services.igdb_types import GameType
 from handler.metadata.igdb_handler import IGDBHandler
+from models.rom import Rom
 
 GENESIS_IGDB_ID = 29
 
@@ -308,3 +309,116 @@ class TestSearchRomGameTypeFilter:
         assert any(
             "-" in w for w in captured_where
         ), f"Expected dashes preserved in IGDB wildcard query, got: {captured_where}"
+
+    @pytest.mark.asyncio
+    async def test_get_rom_preserves_punctuation_in_search_term(self):
+        """get_rom must normalize the term with remove_punctuation=False so
+        dashes/colons reach _search_rom. The _search_rom-level tests pass the
+        term in directly, so this is the only test that pins that line."""
+        handler = IGDBHandler()
+        PSX_IGDB_ID = 7
+        captured_terms: list[str] = []
+
+        async def fake_search_rom(search_term, platform_igdb_id, with_game_type=False):
+            captured_terms.append(search_term)
+            return None
+
+        with (
+            patch(
+                "handler.metadata.igdb_handler.IGDBHandler.is_enabled",
+                return_value=True,
+            ),
+            patch.object(handler, "_search_rom", side_effect=fake_search_rom),
+        ):
+            await handler.get_rom(
+                Rom(), "007 - Die Welt Ist Nicht Genug.chd", PSX_IGDB_ID
+            )
+
+        assert captured_terms, "_search_rom was never called"
+        assert all("-" in term for term in captured_terms), (
+            "Expected the dash to survive normalization into the term passed to "
+            f"_search_rom, got {captured_terms}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_quotes_are_stripped_from_igdb_query(self):
+        """A double-quote in the term must not leak into the APIcalypse query,
+        where it would terminate the quoted string literal and break the search.
+        Dashes/colons are kept; only quotes/backslashes are removed."""
+        handler = IGDBHandler()
+        list_terms: list[str] = []
+        search_wheres: list[str] = []
+
+        async def mock_list_games(
+            search_term=None, fields=None, where=None, limit=None
+        ):
+            if search_term is not None:
+                list_terms.append(search_term)
+            return []
+
+        async def mock_search(fields=None, where=None, limit=None):
+            if where:
+                search_wheres.append(where)
+            return []
+
+        with (
+            patch(
+                "handler.metadata.igdb_handler.IGDBHandler.is_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                handler.igdb_service, "list_games", side_effect=mock_list_games
+            ),
+            patch.object(handler.igdb_service, "search", side_effect=mock_search),
+        ):
+            await handler._search_rom(
+                '007 - "die welt"', GENESIS_IGDB_ID, with_game_type=False
+            )
+
+        assert all(
+            '"' not in term for term in list_terms
+        ), f"Quote leaked into the search term sent to IGDB: {list_terms}"
+        assert search_wheres, "expanded search endpoint was never reached"
+        for where in search_wheres:
+            # Two `*"..."*` wildcards => exactly four double-quotes; a stray
+            # quote from the term would push this higher and break the query.
+            assert where.count('"') == 4, f"stray quote leaked into where: {where}"
+            assert "-" in where, f"dash should be preserved in where: {where}"
+
+    @pytest.mark.asyncio
+    async def test_name_collision_prefers_lowest_igdb_id(self):
+        """When two games share a name, the lower IGDB id wins deterministically,
+        independent of the order IGDB returns them in."""
+        handler = IGDBHandler()
+
+        # Same name, returned highest-id-first to prove order doesn't decide it.
+        higher = _make_game(999, "Double Dragon")
+        lower = _make_game(42, "Double Dragon")
+
+        async def mock_list_games(
+            search_term=None, fields=None, where=None, limit=None
+        ):
+            if where and "game_type" in where:
+                return [higher, lower]
+            return []
+
+        with (
+            patch(
+                "handler.metadata.igdb_handler.IGDBHandler.is_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                handler.igdb_service, "list_games", side_effect=mock_list_games
+            ),
+            patch.object(
+                handler.igdb_service, "search", new_callable=AsyncMock, return_value=[]
+            ),
+        ):
+            result = await handler._search_rom(
+                "double dragon", GENESIS_IGDB_ID, with_game_type=True
+            )
+
+        assert result is not None
+        assert (
+            result["id"] == 42
+        ), f"Expected the lower IGDB id (42) on a name collision, got {result['id']}"
