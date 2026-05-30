@@ -486,12 +486,19 @@ class IGDBHandler(MetadataHandler):
 
         games_by_name: dict[str, Game] = {}
         for game in roms:
-            game_name = game.get("name", "")
-            if (
-                game_name not in games_by_name
-                or game["id"] < games_by_name[game_name]["id"]
-            ):
-                games_by_name[game_name] = game
+            candidate_names: list[str] = []
+            primary = game.get("name", "")
+            if primary:
+                candidate_names.append(primary)
+            for alt in game.get("alternative_names", []):
+                if isinstance(alt, dict) and (alt_name := alt.get("name")):
+                    candidate_names.append(alt_name)
+            for loc in game.get("game_localizations", []):
+                if isinstance(loc, dict) and (loc_name := loc.get("name")):
+                    candidate_names.append(loc_name)
+            for name in candidate_names:
+                if name not in games_by_name:
+                    games_by_name[name] = game
 
         best_match, best_score = self.find_best_match(
             search_term,
@@ -535,9 +542,22 @@ class IGDBHandler(MetadataHandler):
 
             extra_games_by_name: dict[str, Game] = {}
             for game in extra_roms:
-                game_name = game.get("name", "")
-                if game_name not in extra_games_by_name:
-                    extra_games_by_name[game_name] = game
+                # Index the game under its primary name and every alternative /
+                # localized name so find_best_match can score against whichever
+                # title the filename actually uses.
+                extra_candidate_names: list[str] = []
+                primary = game.get("name", "")
+                if primary:
+                    extra_candidate_names.append(primary)
+                for alt in game.get("alternative_names", []):
+                    if isinstance(alt, dict) and (alt_name := alt.get("name")):
+                        extra_candidate_names.append(alt_name)
+                for loc in game.get("game_localizations", []):
+                    if isinstance(loc, dict) and (loc_name := loc.get("name")):
+                        extra_candidate_names.append(loc_name)
+                for name in extra_candidate_names:
+                    if name not in extra_games_by_name:
+                        extra_games_by_name[name] = game
 
             best_match, best_score = self.find_best_match(
                 search_term,
@@ -694,7 +714,11 @@ class IGDBHandler(MetadataHandler):
             search_term = await self._scummvm_format(search_term)
             fallback_rom = IGDBRom(igdb_id=None, name=search_term)
 
-        search_term = self.normalize_search_term(search_term)
+        # Keep punctuation (dashes, colons) so IGDB wildcard queries can match
+        # alternative_names that contain them — e.g. "007 - Die Welt Ist Nicht Genug"
+        # won't be found if the search term strips dashes to "007 die welt...".
+        # find_best_match normalises both sides internally, so scoring is unaffected.
+        search_term = self.normalize_search_term(search_term, remove_punctuation=False)
 
         log.debug("Searching for %s on IGDB with game_type", search_term)
         res = await self._search_rom(search_term, platform_igdb_id, with_game_type=True)
