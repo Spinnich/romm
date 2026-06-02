@@ -1,7 +1,8 @@
 import html
 import re
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Final, NotRequired, TypedDict
+from typing import Final, NotRequired, TypedDict, cast
 from urllib.parse import quote, urlparse
 
 import pydash
@@ -220,6 +221,110 @@ def _get_rom_type(file: RomFile) -> str:
     return "rom"
 
 
+@dataclass(frozen=True)
+class _SSMediaResource:
+    """A downloadable ScreenScraper resource: its media type, the path field it
+    populates on SSMetadataMedia, and the local filename to store it under."""
+
+    media_type: MetadataMediaType
+    path_field: str
+    filename: str
+
+
+@dataclass(frozen=True)
+class _SSMediaSpec:
+    """Maps a ScreenScraper media "type" onto the SSMetadataMedia URL field it
+    fills, plus an optional resource to download when its media type is
+    selected."""
+
+    url_field: str
+    resource: _SSMediaResource | None = None
+
+
+# ScreenScraper media "type" -> where its URL (and optional downloaded resource)
+# is stored on SSMetadataMedia. Several SS types map to the same field (e.g.
+# wheel-hd/wheel -> logo, miximage1/miximage2/mixrbv1 -> miximage); the first
+# match across the preferred-region scan wins.
+_SS_MEDIA_SPECS: Final[dict[str, _SSMediaSpec]] = {
+    "box-2D-back": _SSMediaSpec(
+        "box2d_back_url",
+        _SSMediaResource(
+            MetadataMediaType.BOX2D_BACK, "box2d_back_path", "box2d_back.png"
+        ),
+    ),
+    "bezel-16-9": _SSMediaSpec(
+        "bezel_url",
+        _SSMediaResource(MetadataMediaType.BEZEL, "bezel_path", "bezel.png"),
+    ),
+    "box-2D": _SSMediaSpec("box2d_url"),
+    "fanart": _SSMediaSpec(
+        "fanart_url",
+        _SSMediaResource(MetadataMediaType.FANART, "fanart_path", "fanart.png"),
+    ),
+    "box-texture": _SSMediaSpec("fullbox_url"),
+    "wheel-hd": _SSMediaSpec(
+        "logo_url",
+        _SSMediaResource(MetadataMediaType.LOGO, "logo_path", "logo.png"),
+    ),
+    "wheel": _SSMediaSpec(
+        "logo_url",
+        _SSMediaResource(MetadataMediaType.LOGO, "logo_path", "logo.png"),
+    ),
+    "manuel": _SSMediaSpec("manual_url"),
+    "screenmarquee": _SSMediaSpec(
+        "marquee_url",
+        _SSMediaResource(MetadataMediaType.MARQUEE, "marquee_path", "marquee.png"),
+    ),
+    "miximage1": _SSMediaSpec(
+        "miximage_url",
+        _SSMediaResource(MetadataMediaType.MIXIMAGE, "miximage_path", "miximage.png"),
+    ),
+    "miximage2": _SSMediaSpec(
+        "miximage_url",
+        _SSMediaResource(MetadataMediaType.MIXIMAGE, "miximage_path", "miximage.png"),
+    ),
+    "mixrbv1": _SSMediaSpec(
+        "miximage_url",
+        _SSMediaResource(MetadataMediaType.MIXIMAGE, "miximage_path", "miximage.png"),
+    ),
+    "mixrbv2": _SSMediaSpec(
+        "miximage_v2_url",
+        _SSMediaResource(
+            MetadataMediaType.MIXIMAGE_V2, "miximage_v2_path", "miximage_v2.png"
+        ),
+    ),
+    "support-2D": _SSMediaSpec(
+        "physical_url",
+        _SSMediaResource(MetadataMediaType.PHYSICAL, "physical_path", "physical.png"),
+    ),
+    "ss": _SSMediaSpec("screenshot_url"),
+    "box-2D-side": _SSMediaSpec("box2d_side_url"),
+    "steamgrid": _SSMediaSpec("steamgrid_url"),
+    "box-3D": _SSMediaSpec(
+        "box3d_url",
+        _SSMediaResource(MetadataMediaType.BOX3D, "box3d_path", "box3d.png"),
+    ),
+    "sstitle": _SSMediaSpec(
+        "title_screen_url",
+        _SSMediaResource(
+            MetadataMediaType.TITLE_SCREEN, "title_screen_path", "title_screen.png"
+        ),
+    ),
+    "video": _SSMediaSpec(
+        "video_url",
+        _SSMediaResource(MetadataMediaType.VIDEO, "video_path", "video.mp4"),
+    ),
+    "video-normalized": _SSMediaSpec(
+        "video_normalized_url",
+        _SSMediaResource(
+            MetadataMediaType.VIDEO_NORMALIZED,
+            "video_normalized_path",
+            "video-normalized.mp4",
+        ),
+    ),
+}
+
+
 def extract_media_from_ss_game(rom: Rom, game: SSGame) -> SSMetadataMedia:
     preferred_media_types = get_preferred_media_types()
 
@@ -255,148 +360,28 @@ def extract_media_from_ss_game(rom: Rom, game: SSGame) -> SSMetadataMedia:
         video_path=None,
         video_normalized_path=None,
     )
+    # Dynamic field assignment isn't expressible against the TypedDict, so write
+    # through a plain-dict view of the same underlying object.
+    media_fields = cast(dict[str, str | None], ss_media)
 
     for region in get_preferred_regions(rom):
         for media in game.get("medias", []):
             if media.get("region", "unk") != region or media.get("parent") != "jeu":
                 continue
 
-            if media.get("type") == "box-2D-back" and not ss_media["box2d_back_url"]:
-                ss_media["box2d_back_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.BOX2D_BACK in preferred_media_types:
-                    ss_media["box2d_back_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.BOX2D_BACK)}/box2d_back.png"
-                    )
-            elif media.get("type") == "bezel-16-9" and not ss_media["bezel_url"]:
-                ss_media["bezel_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.BEZEL in preferred_media_types:
-                    ss_media["bezel_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.BEZEL)}/bezel.png"
-                    )
-            elif media.get("type") == "box-2D" and not ss_media["box2d_url"]:
-                ss_media["box2d_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-            elif media.get("type") == "fanart" and not ss_media["fanart_url"]:
-                ss_media["fanart_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.FANART in preferred_media_types:
-                    ss_media["fanart_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.FANART)}/fanart.png"
-                    )
-            elif media.get("type") == "box-texture" and not ss_media["fullbox_url"]:
-                ss_media["fullbox_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-            elif media.get("type") == "wheel-hd" and not ss_media["logo_url"]:
-                ss_media["logo_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
+            spec = _SS_MEDIA_SPECS.get(media.get("type", ""))
+            if spec is None or media_fields[spec.url_field]:
+                continue
 
-                if MetadataMediaType.LOGO in preferred_media_types:
-                    ss_media["logo_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.LOGO)}/logo.png"
-                    )
-            elif media.get("type") == "wheel" and not ss_media["logo_url"]:
-                ss_media["logo_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
+            media_fields[spec.url_field] = strip_sensitive_query_params(
+                media["url"], SENSITIVE_KEYS
+            )
+
+            resource = spec.resource
+            if resource is not None and resource.media_type in preferred_media_types:
+                media_fields[resource.path_field] = (
+                    f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, resource.media_type)}/{resource.filename}"
                 )
-                if MetadataMediaType.LOGO in preferred_media_types:
-                    ss_media["logo_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.LOGO)}/logo.png"
-                    )
-            elif media.get("type") == "manuel" and not ss_media["manual_url"]:
-                ss_media["manual_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-            elif media.get("type") == "screenmarquee" and not ss_media["marquee_url"]:
-                ss_media["marquee_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.MARQUEE in preferred_media_types:
-                    ss_media["marquee_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.MARQUEE)}/marquee.png"
-                    )
-            elif (
-                media.get("type") == "miximage1"
-                or media.get("type") == "miximage2"
-                or media.get("type") == "mixrbv1"
-            ) and not ss_media["miximage_url"]:
-                ss_media["miximage_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.MIXIMAGE in preferred_media_types:
-                    ss_media["miximage_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.MIXIMAGE)}/miximage.png"
-                    )
-            elif media.get("type") == "mixrbv2" and not ss_media["miximage_v2_url"]:
-                ss_media["miximage_v2_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.MIXIMAGE_V2 in preferred_media_types:
-                    ss_media["miximage_v2_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.MIXIMAGE_V2)}/miximage_v2.png"
-                    )
-            elif media.get("type") == "support-2D" and not ss_media["physical_url"]:
-                ss_media["physical_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.PHYSICAL in preferred_media_types:
-                    ss_media["physical_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.PHYSICAL)}/physical.png"
-                    )
-            elif media.get("type") == "ss" and not ss_media["screenshot_url"]:
-                ss_media["screenshot_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-            elif media.get("type") == "box-2D-side" and not ss_media["box2d_side_url"]:
-                ss_media["box2d_side_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-            elif media.get("type") == "steamgrid" and not ss_media["steamgrid_url"]:
-                ss_media["steamgrid_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-            elif media.get("type") == "box-3D" and not ss_media["box3d_url"]:
-                ss_media["box3d_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.BOX3D in preferred_media_types:
-                    ss_media["box3d_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.BOX3D)}/box3d.png"
-                    )
-            elif media.get("type") == "sstitle" and not ss_media["title_screen_url"]:
-                ss_media["title_screen_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.TITLE_SCREEN in preferred_media_types:
-                    ss_media["title_screen_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.TITLE_SCREEN)}/title_screen.png"
-                    )
-            elif media.get("type") == "video" and not ss_media["video_url"]:
-                ss_media["video_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.VIDEO in preferred_media_types:
-                    ss_media["video_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.VIDEO)}/video.mp4"
-                    )
-            elif (
-                media.get("type") == "video-normalized"
-                and not ss_media["video_normalized_url"]
-            ):
-                ss_media["video_normalized_url"] = strip_sensitive_query_params(
-                    media["url"], SENSITIVE_KEYS
-                )
-                if MetadataMediaType.VIDEO_NORMALIZED in preferred_media_types:
-                    ss_media["video_normalized_path"] = (
-                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.VIDEO_NORMALIZED)}/video-normalized.mp4"
-                    )
 
     return ss_media
 
