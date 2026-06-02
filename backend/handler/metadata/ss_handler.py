@@ -510,6 +510,18 @@ def extract_metadata_from_ss_rom(rom: Rom, game: SSGame) -> SSMetadata:
     )
 
 
+def _switch_index_fallback_rom(index_entry: dict) -> SSRom:
+    """Build a fallback SSRom from a Switch TitleDB/ProductID index entry."""
+    return SSRom(
+        ss_id=None,
+        name=index_entry["name"],
+        summary=index_entry.get("description", ""),
+        url_cover=index_entry.get("iconUrl", ""),
+        url_manual=index_entry.get("iconUrl", ""),
+        url_screenshots=index_entry.get("screenshots", None) or [],
+    )
+
+
 def build_ss_game(rom: Rom, game: SSGame) -> SSRom:
     ss_metadata = extract_metadata_from_ss_rom(rom, game)
     preferred_media_types = get_preferred_media_types()
@@ -789,14 +801,7 @@ class SSHandler(MetadataHandler):
                 match, search_term
             )
             if index_entry:
-                fallback_rom = SSRom(
-                    ss_id=None,
-                    name=index_entry["name"],
-                    summary=index_entry.get("description", ""),
-                    url_cover=index_entry.get("iconUrl", ""),
-                    url_manual=index_entry.get("iconUrl", ""),
-                    url_screenshots=index_entry.get("screenshots", None) or [],
-                )
+                fallback_rom = _switch_index_fallback_rom(index_entry)
 
         # Support for switch productID filename format
         match = SWITCH_PRODUCT_ID_REGEX.search(file_name)
@@ -805,14 +810,7 @@ class SSHandler(MetadataHandler):
                 match, search_term
             )
             if index_entry:
-                fallback_rom = SSRom(
-                    ss_id=None,
-                    name=index_entry["name"],
-                    summary=index_entry.get("description", ""),
-                    url_cover=index_entry.get("iconUrl", ""),
-                    url_manual=index_entry.get("iconUrl", ""),
-                    url_screenshots=index_entry.get("screenshots", None) or [],
-                )
+                fallback_rom = _switch_index_fallback_rom(index_entry)
 
         # Support for MAME arcade filename format
         if platform_ss_id in ARCADES_SS_IDS:
