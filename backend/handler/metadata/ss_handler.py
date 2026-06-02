@@ -614,6 +614,11 @@ class SSHandler(MetadataHandler):
             return int(match.group(1))
         return None
 
+    @staticmethod
+    def _encode_search_term(search_term: str) -> str:
+        """Transliterate to ASCII and URL-encode a term for the SS search API."""
+        return quote(uc(search_term), safe="/ ")
+
     async def _search_rom(
         self, search_term: str, platform_ss_id: int, split_game_name: bool = False
     ) -> SSGame | None:
@@ -621,7 +626,7 @@ class SSHandler(MetadataHandler):
             return None
 
         roms = await self.ss_service.search_games(
-            term=quote(uc(search_term), safe="/ "),
+            term=self._encode_search_term(search_term),
             system_id=platform_ss_id,
         )
 
@@ -856,7 +861,7 @@ class SSHandler(MetadataHandler):
             return []
 
         matched_games = await self.ss_service.search_games(
-            term=quote(uc(search_term), safe="/ "),
+            term=self._encode_search_term(search_term),
             system_id=platform_ss_id,
         )
 
