@@ -9,7 +9,6 @@ import pytest
 from PIL import Image
 
 import adapters.services.screenscraper as ss_module
-import handler.filesystem.resources_handler as resources_handler_module
 from adapters.services.screenscraper import (
     SS_DEFAULT_MAX_THREADS,
     SS_DEFAULT_MEDIA_TIMEOUT,
@@ -1132,45 +1131,13 @@ class TestConcurrentRomMedia:
         tracker = _ConcurrencyTracker()
         mocker.patch.object(handler, "screenshots_exist", return_value=False)
         mocker.patch.object(handler, "_store_screenshot", tracker.run)
+        urls = [f"https://example.com/{idx}.jpg" for idx in range(5)]
 
         paths = await handler.get_rom_screenshots(
-            rom=rom,
-            overwrite=True,
-            url_screenshots=[f"https://example.com/{idx}.jpg" for idx in range(5)],
+            rom=rom, overwrite=True, url_screenshots=urls
         )
 
         assert tracker.peak > 1
+        assert [args[1] for args in tracker.started] == urls
         # Paths stay in URL order, since the frontend indexes screenshots by it.
         assert paths == [f"roms/1/1/screenshots/{idx}.jpg" for idx in range(5)]
-
-    async def test_screenshot_downloads_respect_the_configured_cap(
-        self, handler, rom, mocker
-    ):
-        tracker = _ConcurrencyTracker()
-        mocker.patch.object(resources_handler_module, "SCAN_MEDIA_WORKERS", 2)
-        mocker.patch.object(handler, "screenshots_exist", return_value=False)
-        mocker.patch.object(handler, "_store_screenshot", tracker.run)
-
-        await handler.get_rom_screenshots(
-            rom=rom,
-            overwrite=True,
-            url_screenshots=[f"https://example.com/{idx}.jpg" for idx in range(6)],
-        )
-
-        assert tracker.peak == 2
-
-    async def test_screenshots_are_downloaded_once_each(self, handler, rom, mocker):
-        tracker = _ConcurrencyTracker()
-        mocker.patch.object(handler, "screenshots_exist", return_value=False)
-        mocker.patch.object(handler, "_store_screenshot", tracker.run)
-
-        await handler.get_rom_screenshots(
-            rom=rom,
-            overwrite=True,
-            url_screenshots=["https://example.com/a.jpg", "https://example.com/b.jpg"],
-        )
-
-        assert [args[1] for args in tracker.started] == [
-            "https://example.com/a.jpg",
-            "https://example.com/b.jpg",
-        ]

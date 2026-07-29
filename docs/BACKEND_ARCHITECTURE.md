@@ -1607,6 +1607,7 @@ Falls back to `FakeRedis` in test mode.
 | -------------------------------------- | ----------- | ------------------------------- |
 | `SCAN_TIMEOUT`                         | `14400`     | 4-hour scan timeout             |
 | `SCAN_WORKERS`                         | `1`         | Concurrent scan workers         |
+| `SCAN_MEDIA_WORKERS`                   | `8`         | Media downloads per ROM         |
 | `TASK_TIMEOUT`                         |             | RQ job timeout for manual tasks |
 | `TASK_RESULT_TTL`                      |             | How long to keep job results    |
 | `ENABLE_SCHEDULED_RESCAN`              | `false`     | Auto library rescan             |
