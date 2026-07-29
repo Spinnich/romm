@@ -1,3 +1,4 @@
+import asyncio
 from itertools import count
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -5,6 +6,7 @@ import pytest
 import socketio
 from rq.job import Job, JobStatus
 
+from config.config_manager import MetadataMediaType
 from endpoints.sockets import scan as scan_module
 from endpoints.sockets.scan import (
     ScanStats,
@@ -1202,3 +1204,260 @@ class TestStopScan:
         await stop_scan_handler("sid")
 
         redis.set.assert_not_called()
+
+
+class _MediaTracker:
+    """Stands in for the resource handler, recording overlap and requests."""
+
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.peak = 0
+        self.calls: list[tuple] = []
+
+    def download(self, label: str, result=None, raises: Exception | None = None):
+        async def run(*args, **kwargs):
+            self.calls.append((label, args))
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            await asyncio.sleep(0)
+            self.in_flight -= 1
+            if raises is not None:
+                raise raises
+            return result
+
+        return run
+
+    def labels(self) -> list[str]:
+        return [label for label, _ in self.calls]
+
+
+class TestConcurrentRomMedia:
+    """A ROM's files are fetched together. Downloading a cover, a manual, a dozen
+    screenshots and every achievement badge one after another left the scan idle
+    waiting on a single connection."""
+
+    @pytest.fixture
+    def tracker(self):
+        return _MediaTracker()
+
+    @pytest.fixture
+    def rom(self):
+        rom = MagicMock(spec=Rom)
+        rom.id = 7
+        rom.platform_id = 1
+        rom.fs_name = "Game.zip"
+        rom.url_cover = "https://example.com/old-cover.png"
+        rom.url_manual = "https://example.com/old-manual.pdf"
+        rom.url_screenshots = []
+        return rom
+
+    @pytest.fixture
+    def added_rom(self):
+        added = MagicMock(spec=Rom)
+        added.id = 7
+        added.platform_id = 1
+        added.fs_name = "Game.zip"
+        added.is_identified = True
+        added.url_cover = "https://example.com/cover.png"
+        added.url_manual = "https://example.com/manual.pdf"
+        added.url_screenshots = ["https://example.com/ss0.jpg"]
+        added.path_cover_s = "existing/small.png"
+        added.path_cover_l = "existing/big.png"
+        added.path_manual = "existing/manual.pdf"
+        added.path_screenshots = ["existing/0.jpg"]
+        added.ss_metadata = {
+            "box2d_url": "https://example.com/box2d.png",
+            "box2d_path": "roms/1/7/box2d/big.png",
+        }
+        added.ra_metadata = {
+            "achievements": [
+                {
+                    "badge_url": "https://example.com/1.png",
+                    "badge_path": "badges/1.png",
+                    "badge_url_lock": "https://example.com/1_lock.png",
+                    "badge_path_lock": "badges/1_lock.png",
+                },
+            ]
+        }
+        added.gamelist_metadata = {}
+        added.launchbox_metadata = {}
+        return added
+
+    @pytest.fixture
+    def patched(self, mocker, tracker, added_rom):
+        mocker.patch.object(
+            scan_module, "redis_client", Mock(get=Mock(return_value=None))
+        )
+
+        fs = scan_module.fs_rom_handler
+        mocker.patch.object(
+            fs,
+            "parse_tags",
+            return_value=ParsedTags(
+                version="", revision="", regions=[], languages=[], other_tags=[]
+            ),
+        )
+        mocker.patch.object(fs, "get_roms_fs_structure", return_value="test/roms")
+        mocker.patch.object(fs, "get_file_name_with_no_tags", return_value="Game")
+
+        config = MagicMock()
+        config.SKIP_HASH_CALCULATION = False
+        mocker.patch.object(scan_module.cm, "get_config", return_value=config)
+        mocker.patch.object(
+            scan_module,
+            "scan_rom",
+            AsyncMock(return_value=MagicMock(is_identified=True)),
+        )
+        mocker.patch.object(scan_module, "SimpleRomSchema", MagicMock())
+        mocker.patch.object(
+            scan_module,
+            "get_preferred_media_types",
+            return_value=[MetadataMediaType.BOX2D],
+        )
+        mocker.patch.object(scan_module, "add_ss_auth_to_url", side_effect=lambda u: u)
+
+        db = mocker.patch.object(scan_module, "db_rom_handler")
+        db.add_rom.return_value = added_rom
+
+        resources = scan_module.fs_resource_handler
+        mocker.patch.object(
+            resources,
+            "get_cover",
+            tracker.download("cover", result=("new/small.png", "new/big.png")),
+        )
+        mocker.patch.object(
+            resources, "get_manual", tracker.download("manual", result="new/manual.pdf")
+        )
+        mocker.patch.object(
+            resources,
+            "get_rom_screenshots",
+            tracker.download("screenshots", result=["new/0.jpg"]),
+        )
+        mocker.patch.object(resources, "store_media_file", tracker.download("media"))
+        mocker.patch.object(resources, "store_ra_badge", tracker.download("badge"))
+        return db
+
+    async def _run(self, rom):
+        fs_rom: FSRom = {
+            "fs_name": "Game.zip",
+            "flat": True,
+            "nested": False,
+            "files": [],
+            "crc_hash": "",
+            "md5_hash": "",
+            "sha1_hash": "",
+            "ra_hash": "",
+        }
+        platform = Platform(name="Test", slug="test", fs_slug="test")
+        platform.id = 1
+
+        await _identify_rom(
+            platform=platform,
+            fs_rom=fs_rom,
+            rom=rom,
+            scan_type=ScanType.QUICK,
+            roms_ids=[],
+            metadata_sources=[MetadataSource.SS, MetadataSource.RA],
+            launchbox_remote_enabled=False,
+            playmatch_enabled=False,
+            socket_manager=AsyncMock(),
+            scan_stats=AsyncMock(),
+        )
+
+    async def test_every_file_is_fetched_at_once(self, patched, tracker, rom):
+        await self._run(rom)
+
+        # Cover, manual, screenshots, one ScreenScraper media file and both
+        # badges, all in flight together.
+        assert sorted(tracker.labels()) == [
+            "badge",
+            "badge",
+            "cover",
+            "manual",
+            "media",
+            "screenshots",
+        ]
+        assert tracker.peak == len(tracker.calls)
+
+    async def test_downloads_respect_the_configured_cap(
+        self, patched, tracker, rom, mocker
+    ):
+        mocker.patch.object(scan_module, "SCAN_MEDIA_WORKERS", 2)
+
+        await self._run(rom)
+
+        assert tracker.peak == 2
+
+    async def test_paths_are_persisted_from_the_concurrent_results(
+        self, patched, tracker, rom
+    ):
+        db = patched
+
+        await self._run(rom)
+
+        db.update_rom.assert_called_once()
+        _, data = db.update_rom.call_args.args
+        assert data == {
+            "path_cover_s": "new/small.png",
+            "path_cover_l": "new/big.png",
+            "path_screenshots": ["new/0.jpg"],
+            "path_manual": "new/manual.pdf",
+        }
+
+    async def test_a_failed_download_does_not_cost_the_rest(
+        self, patched, tracker, rom, mocker
+    ):
+        db = patched
+        mocker.patch.object(
+            scan_module.fs_resource_handler,
+            "get_cover",
+            tracker.download("cover", raises=OSError("boom")),
+        )
+
+        await self._run(rom)
+
+        assert tracker.labels().count("badge") == 2
+        assert "media" in tracker.labels()
+        # The failure leaves the stored cover alone rather than blanking it.
+        _, data = db.update_rom.call_args.args
+        assert data["path_cover_s"] == "existing/small.png"
+        assert data["path_cover_l"] == "existing/big.png"
+        assert data["path_manual"] == "new/manual.pdf"
+
+    async def test_a_resource_that_is_gone_still_clears_its_path(
+        self, patched, tracker, rom, mocker
+    ):
+        """A missing manual reads as None, which must not be mistaken for a
+        failed download and answered by keeping the old path."""
+        db = patched
+        mocker.patch.object(
+            scan_module.fs_resource_handler,
+            "get_manual",
+            tracker.download("manual", result=None),
+        )
+
+        await self._run(rom)
+
+        _, data = db.update_rom.call_args.args
+        assert data["path_manual"] is None
+
+    async def test_a_duplicated_destination_is_downloaded_once(
+        self, patched, tracker, rom, added_rom
+    ):
+        # Concurrent writes to one path would interleave into a corrupt file.
+        added_rom.ra_metadata = {
+            "achievements": [
+                {
+                    "badge_url": "https://example.com/1.png",
+                    "badge_path": "badges/1.png",
+                },
+                {
+                    "badge_url": "https://example.com/1.png",
+                    "badge_path": "badges/1.png",
+                },
+            ]
+        }
+
+        await self._run(rom)
+
+        assert tracker.labels().count("badge") == 1

@@ -1,3 +1,4 @@
+import asyncio
 import errno
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from PIL import Image
 
 import adapters.services.screenscraper as ss_module
+import handler.filesystem.resources_handler as resources_handler_module
 from adapters.services.screenscraper import (
     SS_DEFAULT_MAX_THREADS,
     SS_DEFAULT_MEDIA_TIMEOUT,
@@ -1078,4 +1080,97 @@ class TestScreenScraperMediaThrottling:
 
         assert client.calls == [
             {"timeout": SS_DEFAULT_MEDIA_TIMEOUT, "in_flight": 0},
+        ]
+
+
+class _ConcurrencyTracker:
+    """Records how many downloads overlapped, and in what order they started."""
+
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.peak = 0
+        self.started: list = []
+
+    async def run(self, *args, **kwargs):
+        self.started.append(args)
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        await asyncio.sleep(0)
+        self.in_flight -= 1
+        return None
+
+
+class TestConcurrentRomMedia:
+    """A ROM's files are independent downloads, so they run together instead of
+    the ROM waiting out the sum of them all."""
+
+    @pytest.fixture
+    def handler(self):
+        return FSResourcesHandler()
+
+    @pytest.fixture
+    def rom(self):
+        rom = Mock(spec=Rom)
+        rom.id = 1
+        rom.platform_id = 1
+        rom.fs_resources_path = "roms/1/1"
+        rom.path_screenshots = []
+        return rom
+
+    async def test_cover_sizes_download_concurrently(self, handler, rom, mocker):
+        tracker = _ConcurrencyTracker()
+        mocker.patch.object(handler, "cover_exists", return_value=False)
+        mocker.patch.object(handler, "_store_cover", tracker.run)
+
+        await handler.get_cover(
+            entity=rom, overwrite=True, url_cover="https://example.com/cover.png"
+        )
+
+        assert tracker.peak == 2
+
+    async def test_screenshots_download_concurrently(self, handler, rom, mocker):
+        tracker = _ConcurrencyTracker()
+        mocker.patch.object(handler, "screenshots_exist", return_value=False)
+        mocker.patch.object(handler, "_store_screenshot", tracker.run)
+
+        paths = await handler.get_rom_screenshots(
+            rom=rom,
+            overwrite=True,
+            url_screenshots=[f"https://example.com/{idx}.jpg" for idx in range(5)],
+        )
+
+        assert tracker.peak > 1
+        # Paths stay in URL order, since the frontend indexes screenshots by it.
+        assert paths == [f"roms/1/1/screenshots/{idx}.jpg" for idx in range(5)]
+
+    async def test_screenshot_downloads_respect_the_configured_cap(
+        self, handler, rom, mocker
+    ):
+        tracker = _ConcurrencyTracker()
+        mocker.patch.object(resources_handler_module, "SCAN_MEDIA_WORKERS", 2)
+        mocker.patch.object(handler, "screenshots_exist", return_value=False)
+        mocker.patch.object(handler, "_store_screenshot", tracker.run)
+
+        await handler.get_rom_screenshots(
+            rom=rom,
+            overwrite=True,
+            url_screenshots=[f"https://example.com/{idx}.jpg" for idx in range(6)],
+        )
+
+        assert tracker.peak == 2
+
+    async def test_screenshots_are_downloaded_once_each(self, handler, rom, mocker):
+        tracker = _ConcurrencyTracker()
+        mocker.patch.object(handler, "screenshots_exist", return_value=False)
+        mocker.patch.object(handler, "_store_screenshot", tracker.run)
+
+        await handler.get_rom_screenshots(
+            rom=rom,
+            overwrite=True,
+            url_screenshots=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+        )
+
+        assert [args[1] for args in tracker.started] == [
+            "https://example.com/a.jpg",
+            "https://example.com/b.jpg",
         ]

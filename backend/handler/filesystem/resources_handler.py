@@ -9,12 +9,17 @@ from fastapi import status
 from PIL import Image, ImageFile, UnidentifiedImageError
 
 from adapters.services.screenscraper import media_download_slot
-from config import ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP, RESOURCES_BASE_PATH
+from config import (
+    ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP,
+    RESOURCES_BASE_PATH,
+    SCAN_MEDIA_WORKERS,
+)
 from config.config_manager import MetadataMediaType
 from logger.logger import log
 from models.collection import Collection
 from models.rom import Rom
 from tasks.scheduled.convert_images_to_webp import ImageConverter
+from utils.concurrency import gather_bounded
 from utils.context import ctx_httpx_client
 
 from .base_handler import CoverSize, FSHandler
@@ -305,10 +310,14 @@ class FSResourcesHandler(FSHandler):
 
         # Download covers if URL provided and (overwriting or covers don't exist)
         if url_cover:
-            if overwrite or not self.cover_exists(entity, CoverSize.SMALL):
-                await self._store_cover(entity, url_cover, CoverSize.SMALL)
-            if overwrite or not self.cover_exists(entity, CoverSize.BIG):
-                await self._store_cover(entity, url_cover, CoverSize.BIG)
+            await gather_bounded(
+                SCAN_MEDIA_WORKERS,
+                *(
+                    self._store_cover(entity, url_cover, size)
+                    for size in (CoverSize.SMALL, CoverSize.BIG)
+                    if overwrite or not self.cover_exists(entity, size)
+                ),
+            )
 
         # Return paths for existing covers
         path_cover_s = (
@@ -487,12 +496,18 @@ class FSResourcesHandler(FSHandler):
             return rom.path_screenshots or []
 
         # Download and store new screenshots
-        path_screenshots: list[str] = []
-        for idx, url_screenshot in enumerate(url_screenshots):
-            await self._store_screenshot(rom, url_screenshot, idx)
-            path_screenshots.append(self._get_screenshot_path(rom, str(idx)))
+        await gather_bounded(
+            SCAN_MEDIA_WORKERS,
+            *(
+                self._store_screenshot(rom, url_screenshot, idx)
+                for idx, url_screenshot in enumerate(url_screenshots)
+            ),
+        )
 
-        return path_screenshots
+        return [
+            self._get_screenshot_path(rom, str(idx))
+            for idx in range(len(url_screenshots))
+        ]
 
     # Manuals
     def manual_exists(self, rom: Rom) -> bool:

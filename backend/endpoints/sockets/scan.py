@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from itertools import batched, chain
 from typing import Any, Final
@@ -11,7 +12,14 @@ from rq import Worker, get_current_job
 from rq.job import Job, JobStatus
 from sqlalchemy.exc import IntegrityError
 
-from config import DEV_MODE, REDIS_URL, SCAN_TIMEOUT, SCAN_WORKERS, TASK_RESULT_TTL
+from config import (
+    DEV_MODE,
+    REDIS_URL,
+    SCAN_MEDIA_WORKERS,
+    SCAN_TIMEOUT,
+    SCAN_WORKERS,
+    TASK_RESULT_TTL,
+)
 from config.config_manager import MetadataMediaType
 from config.config_manager import config_manager as cm
 from endpoints.responses import TaskType
@@ -64,6 +72,7 @@ from models.rom import Rom
 from tasks.tasks import SCAN_LIBRARY_TASK_FUNC, tasks_scheduler, update_job_meta
 from utils import emoji
 from utils.audio_tags import remove_persisted_cover
+from utils.concurrency import gather_bounded
 from utils.context import initialize_context
 from utils.gamelist_exporter import GamelistExporter
 from utils.pegasus_exporter import PegasusExporter
@@ -273,6 +282,82 @@ def should_scan_rom(
     )
 
     return should_scan
+
+
+def _provider_media_targets(
+    rom: Rom, metadata_sources: list[str]
+) -> list[tuple[str, str]]:
+    """(url, destination) for each provider media file this ROM should have."""
+    media_types = get_preferred_media_types()
+    targets: list[tuple[str, str]] = []
+
+    if rom.ss_metadata and MetadataSource.SS in metadata_sources:
+        for media_type in media_types:
+            url = rom.ss_metadata.get(f"{media_type.value}_url")
+            path = rom.ss_metadata.get(f"{media_type.value}_path")
+            if url and path:
+                targets.append((add_ss_auth_to_url(url), path))
+
+    # ES-DE gamelist.xml and LaunchBox both point at local files.
+    for metadata, source in (
+        (rom.gamelist_metadata, MetadataSource.GAMELIST),
+        (rom.launchbox_metadata, MetadataSource.LAUNCHBOX),
+    ):
+        if metadata and source in metadata_sources:
+            for media_type in media_types:
+                url = metadata.get(f"{media_type.value}_url")
+                path = metadata.get(f"{media_type.value}_path")
+                if url and path:
+                    targets.append((url, path))
+
+    return targets
+
+
+def _ra_badge_targets(rom: Rom, metadata_sources: list[str]) -> list[tuple[str, str]]:
+    """(url, destination) for the locked and unlocked badge of each achievement."""
+    if not rom.ra_metadata or MetadataSource.RA not in metadata_sources:
+        return []
+
+    targets: list[tuple[str, str]] = []
+    for achievement in rom.ra_metadata.get("achievements", []):
+        for url_key, path_key in (
+            ("badge_url_lock", "badge_path_lock"),
+            ("badge_url", "badge_path"),
+        ):
+            url = achievement.get(url_key)
+            path = achievement.get(path_key)
+            if url and path:
+                targets.append((url, path))
+
+    return targets
+
+
+def _resource_result(result: Any, stored: Any, label: str, fs_name: str) -> Any:
+    """A resource fetch's result, or what is already stored if it failed.
+
+    Keeping the stored value means one bad download neither discards its peers
+    nor blanks a path that still points at a good file.
+    """
+    if not isinstance(result, BaseException):
+        return result
+
+    if not isinstance(result, Exception):
+        raise result
+
+    log.error(f"Error fetching {label} for {hl(fs_name)}: {result}")
+    return stored
+
+
+def _unique_destinations(targets: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Drop repeated destinations: concurrent writes to one path interleave."""
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for url, path in targets:
+        if path not in seen:
+            seen.add(path)
+            unique.append((url, path))
+
+    return unique
 
 
 def _should_get_rom_files(
@@ -512,27 +597,72 @@ async def _identify_rom(
     if scan_type == ScanType.HASHES:
         return
 
-    path_cover_s, path_cover_l = await fs_resource_handler.get_cover(
-        entity=_added_rom,
-        overwrite=_added_rom.url_cover != rom.url_cover,
-        url_cover=add_ss_auth_to_url(_added_rom.url_cover),
-    )
-
-    path_manual = await fs_resource_handler.get_manual(
-        rom=_added_rom,
-        overwrite=_added_rom.url_manual != rom.url_manual,
-        url_manual=add_ss_auth_to_url(_added_rom.url_manual),
-    )
-
     screenshots_changed = pydash.xor(
         _added_rom.url_screenshots or [], rom.url_screenshots or []
     )
     url_screenshots = _added_rom.url_screenshots or []
-    path_screenshots = await fs_resource_handler.get_rom_screenshots(
-        rom=_added_rom,
-        overwrite=bool(screenshots_changed),
-        url_screenshots=[add_ss_auth_to_url(u) for u in url_screenshots],
+
+    media_targets = _unique_destinations(
+        _provider_media_targets(_added_rom, metadata_sources)
     )
+    badge_targets = _unique_destinations(
+        _ra_badge_targets(_added_rom, metadata_sources)
+    )
+
+    # Each of these is an independent download from a different place, so the ROM
+    # takes as long as its slowest file instead of the sum of them all. A game
+    # with hundreds of achievement badges used to fetch them one at a time.
+    resource_fetches: list[Coroutine[Any, Any, Any]] = [
+        fs_resource_handler.get_cover(
+            entity=_added_rom,
+            overwrite=_added_rom.url_cover != rom.url_cover,
+            url_cover=add_ss_auth_to_url(_added_rom.url_cover),
+        ),
+        fs_resource_handler.get_manual(
+            rom=_added_rom,
+            overwrite=_added_rom.url_manual != rom.url_manual,
+            url_manual=add_ss_auth_to_url(_added_rom.url_manual),
+        ),
+        fs_resource_handler.get_rom_screenshots(
+            rom=_added_rom,
+            overwrite=bool(screenshots_changed),
+            url_screenshots=[add_ss_auth_to_url(u) for u in url_screenshots],
+        ),
+    ]
+    labels = ["cover", "manual", "screenshots"]
+
+    resource_fetches.extend(
+        fs_resource_handler.store_media_file(url, path) for url, path in media_targets
+    )
+    labels.extend(f"media file {path}" for _, path in media_targets)
+
+    resource_fetches.extend(
+        fs_resource_handler.store_ra_badge(url, path) for url, path in badge_targets
+    )
+    labels.extend(f"badge {path}" for _, path in badge_targets)
+
+    fetch_results = await gather_bounded(
+        SCAN_MEDIA_WORKERS, *resource_fetches, return_exceptions=True
+    )
+
+    fs_name = _added_rom.fs_name
+    path_cover_s, path_cover_l = _resource_result(
+        fetch_results[0],
+        (_added_rom.path_cover_s, _added_rom.path_cover_l),
+        labels[0],
+        fs_name,
+    )
+    path_manual = _resource_result(
+        fetch_results[1], _added_rom.path_manual, labels[1], fs_name
+    )
+    path_screenshots = _resource_result(
+        fetch_results[2], _added_rom.path_screenshots or [], labels[2], fs_name
+    )
+
+    # Media files and badges are written straight to disk, so there is nothing to
+    # keep but the failure itself.
+    for label, result in zip(labels[3:], fetch_results[3:], strict=True):
+        _resource_result(result, None, label, fs_name)
 
     _added_rom.path_cover_s = path_cover_s
     _added_rom.path_cover_l = path_cover_l
@@ -549,52 +679,6 @@ async def _identify_rom(
             "path_manual": path_manual,
         },
     )
-
-    # Handle special media files from Screenscraper
-    if _added_rom.ss_metadata and MetadataSource.SS in metadata_sources:
-        preferred_media_types = get_preferred_media_types()
-        for media_type in preferred_media_types:
-            media_path = _added_rom.ss_metadata.get(f"{media_type.value}_path")
-            media_url = _added_rom.ss_metadata.get(f"{media_type.value}_url")
-            if media_path and media_url:
-                await fs_resource_handler.store_media_file(
-                    add_ss_auth_to_url(media_url),
-                    media_path,
-                )
-
-    # Handle special media files from ES-DE gamelist.xml
-    if _added_rom.gamelist_metadata and MetadataSource.GAMELIST in metadata_sources:
-        preferred_media_types = get_preferred_media_types()
-        for media_type in preferred_media_types:
-            if _added_rom.gamelist_metadata.get(f"{media_type.value}_path"):
-                await fs_resource_handler.store_media_file(
-                    _added_rom.gamelist_metadata[f"{media_type.value}_url"],
-                    _added_rom.gamelist_metadata[f"{media_type.value}_path"],
-                )
-
-    # Handle special media files from LaunchBox
-    if _added_rom.launchbox_metadata and MetadataSource.LAUNCHBOX in metadata_sources:
-        preferred_media_types = get_preferred_media_types()
-        for media_type in preferred_media_types:
-            if _added_rom.launchbox_metadata.get(f"{media_type.value}_path"):
-                await fs_resource_handler.store_media_file(
-                    _added_rom.launchbox_metadata[f"{media_type.value}_url"],
-                    _added_rom.launchbox_metadata[f"{media_type.value}_path"],
-                )
-
-    # Store normal and locked badges
-    if _added_rom.ra_metadata and MetadataSource.RA in metadata_sources:
-        for ach in _added_rom.ra_metadata.get("achievements", []):
-            badge_url_lock = ach.get("badge_url_lock", None)
-            badge_path_lock = ach.get("badge_path_lock", None)
-            if badge_url_lock and badge_path_lock:
-                await fs_resource_handler.store_ra_badge(
-                    badge_url_lock, badge_path_lock
-                )
-            badge_url = ach.get("badge_url", None)
-            badge_path = ach.get("badge_path", None)
-            if badge_url and badge_path:
-                await fs_resource_handler.store_ra_badge(badge_url, badge_path)
 
     await socket_manager.emit(
         "scan:scanning_rom",
