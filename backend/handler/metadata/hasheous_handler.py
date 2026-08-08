@@ -8,7 +8,7 @@ from fastapi import HTTPException, status
 
 from config import DEV_MODE, HASHEOUS_API_ENABLED
 from logger.logger import log
-from models.rom import RomFile
+from models.rom import LookupHashes, RomFile
 from utils import get_version
 from utils.context import ctx_httpx_client
 
@@ -55,6 +55,13 @@ class HasheousRom(BaseRom):
 
 
 ACCEPTABLE_FILE_EXTENSIONS_BY_PLATFORM_SLUG = {UPS.DC: ["bin", "chd", "cue"]}
+
+
+def _hash_payload(hashes: LookupHashes) -> dict[str, str]:
+    """A file's lookup hashes in the key casing ByHash expects, empty ones
+    dropped. An empty result means the file can't identify anything."""
+    payload = {"mD5": hashes.md5, "shA1": hashes.sha1, "crc": hashes.crc}
+    return {key: value for key, value in payload.items() if value}
 
 
 def extract_metadata_from_igdb_rom(rom: dict[str, Any]) -> IGDBMetadata:
@@ -264,29 +271,29 @@ class HasheousHandler(MetadataHandler):
             )
         ]
 
-        # The lookup endpoint accepts the hashes of all top-level files, which
-        # increases the accuracy of metadata lookups by letting Hasheous match
-        # against any of them.
-        data: list[dict] = []
-        for file in filtered_files:
-            hashes = file.lookup_hashes
-            file_hashes: dict[str, str | None] = {
-                "mD5": hashes.md5,
-                "shA1": hashes.sha1,
-                "crc": hashes.crc,
-            }
+        candidates = [
+            (file, payload)
+            for file in filtered_files
+            if (payload := _hash_payload(file.lookup_hashes))
+        ]
 
-            # Drop empty hashes and skip files that have none.
-            file_hashes = {key: value for key, value in file_hashes.items() if value}
-            if file_hashes:
-                data.append(file_hashes)
-
-        if not data:
+        if not candidates:
             log.warning(
                 "No hashes provided for Hasheous lookup. "
                 "At least one of md5, sha1, or crc is required."
             )
             return fallback_rom, False
+
+        # The endpoint resolves an array of hashes to the single game they all
+        # belong to, so a file no signature database indexes (a playlist, a
+        # readme, box art) makes the whole lookup 404. Ask about the biggest
+        # top-level file alone, the way ScreenScraper does. Equal sizes break
+        # the tie on path, so a two-disc set always resolves to disc 1: the
+        # scanner walks the filesystem unsorted.
+        _, lookup_hashes = min(
+            candidates, key=lambda pair: (-pair[0].file_size_bytes, pair[0].full_path)
+        )
+        data = [lookup_hashes]
 
         try:
             hasheous_game = await self._request(

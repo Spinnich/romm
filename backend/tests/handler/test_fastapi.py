@@ -723,11 +723,11 @@ def _top_level_rom_file(**kwargs) -> RomFile:
 
 @patch.object(meta_hasheous_handler, "_request", new_callable=AsyncMock)
 @patch.object(meta_hasheous_handler, "is_enabled", return_value=True)
-async def test_lookup_rom_sends_all_top_level_file_hashes(
+async def test_lookup_rom_sends_only_the_largest_top_level_file_hashes(
     mock_is_enabled, mock_request
 ):
-    """lookup_rom must send the hashes of every top-level file as a list,
-    using chd_sha1_hash (and only it) for files that have one, and skipping
+    """lookup_rom must identify the ROM by a single file, the largest top-level
+    one, using chd_sha1_hash (and only it) when that file has one, and ignoring
     files with no hashes or zero size."""
     mock_request.return_value = {}
 
@@ -739,7 +739,7 @@ async def test_lookup_rom_sends_all_top_level_file_hashes(
             sha1_hash="sha1one",
             crc_hash="crcone",
         ),
-        # CHD file: only chd_sha1_hash should be sent, raw md5/crc ignored.
+        # Largest, and a CHD: only chd_sha1_hash is sent, raw md5/crc ignored.
         _top_level_rom_file(
             file_name="disc2.chd",
             file_size_bytes=200,
@@ -747,13 +747,11 @@ async def test_lookup_rom_sends_all_top_level_file_hashes(
             crc_hash="ignoredcrc",
             chd_sha1_hash="chdsha1",
         ),
-        # Zero-size file: must be filtered out entirely.
         _top_level_rom_file(
             file_name="empty.bin",
             file_size_bytes=0,
             md5_hash="zeromd5",
         ),
-        # No hashes at all: must be skipped.
         _top_level_rom_file(file_name="nohash.bin", file_size_bytes=50),
     ]
 
@@ -764,10 +762,138 @@ async def test_lookup_rom_sends_all_top_level_file_hashes(
     assert conclusive is True
     mock_request.assert_called_once()
     sent_data = mock_request.call_args.kwargs["data"]
-    assert sent_data == [
-        {"mD5": "md5one", "shA1": "sha1one", "crc": "crcone"},
-        {"shA1": "chdsha1"},
+    assert sent_data == [{"shA1": "chdsha1"}]
+
+
+@patch.object(meta_hasheous_handler, "_request", new_callable=AsyncMock)
+@patch.object(meta_hasheous_handler, "is_enabled", return_value=True)
+async def test_lookup_rom_ignores_sidecar_files_in_a_folder_rom(
+    mock_is_enabled, mock_request
+):
+    """Issue #4150: the lookup endpoint resolves an array of hashes to the one
+    game they all belong to, so a file no signature database indexes (here an
+    .m3u playlist, but a readme or box art does the same) 404s the whole
+    request. Asking about the main ROM file alone keeps the sidecar out of it,
+    whatever its extension."""
+    mock_request.return_value = {"id": 262001, "name": "Enter the Matrix"}
+
+    files = [
+        _top_level_rom_file(
+            file_name="Enter the Matrix (Disc 1).rvz",
+            file_size_bytes=1_213_886_604,
+            md5_hash="094160087a961c2bcf38c6a12bfc18da",
+            sha1_hash="fbee53348a97c7ce0d13049c99215a85b7ae0b58",
+            crc_hash="90681cdb",
+        ),
+        _top_level_rom_file(
+            file_name="Enter the Matrix.m3u",
+            file_size_bytes=98,
+            md5_hash="bef4dd35438b4813781dc049b6a7d4c7",
+            sha1_hash="50d05152d2a67290765ef9fbde262f0b16d45f24",
+            crc_hash="f51fa03c",
+        ),
+        _top_level_rom_file(
+            file_name="Enter the Matrix (Disc 2).rvz",
+            file_size_bytes=1_192_050_688,
+            md5_hash="aa8ace63bedb85264c4b947cfed18d68",
+            sha1_hash="d9d2cf4c97bcfd901fc56dd7e44195deed498b7a",
+            crc_hash="689c5ed2",
+        ),
     ]
+
+    result, _ = await meta_hasheous_handler.lookup_rom("ngc", files)
+
+    assert result["hasheous_id"] == 262001
+    assert mock_request.call_args.kwargs["data"] == [
+        {
+            "mD5": "094160087a961c2bcf38c6a12bfc18da",
+            "shA1": "fbee53348a97c7ce0d13049c99215a85b7ae0b58",
+            "crc": "90681cdb",
+        }
+    ]
+
+
+@patch.object(meta_hasheous_handler, "_request", new_callable=AsyncMock)
+@patch.object(meta_hasheous_handler, "is_enabled", return_value=True)
+async def test_lookup_rom_breaks_size_ties_on_path(mock_is_enabled, mock_request):
+    """The scanner walks the filesystem unsorted, so two equally sized discs
+    must resolve by path or two servers scanning the same library ask about
+    different files."""
+    mock_request.return_value = {}
+
+    files = [
+        _top_level_rom_file(
+            file_name="disc2.rvz", file_size_bytes=100, md5_hash="md5two"
+        ),
+        _top_level_rom_file(
+            file_name="disc1.rvz", file_size_bytes=100, md5_hash="md5one"
+        ),
+    ]
+
+    await meta_hasheous_handler.lookup_rom("ngc", files)
+
+    assert mock_request.call_args.kwargs["data"] == [{"mD5": "md5one"}]
+
+
+@patch.object(meta_hasheous_handler, "_request", new_callable=AsyncMock)
+@patch.object(meta_hasheous_handler, "is_enabled", return_value=True)
+async def test_lookup_rom_skips_a_larger_file_that_has_no_hashes(
+    mock_is_enabled, mock_request
+):
+    """A file with no hashes can't identify anything, so size alone must not
+    win it the lookup."""
+    mock_request.return_value = {}
+
+    files = [
+        _top_level_rom_file(file_name="unhashed.bin", file_size_bytes=500),
+        _top_level_rom_file(
+            file_name="game.bin", file_size_bytes=100, md5_hash="md5one"
+        ),
+    ]
+
+    await meta_hasheous_handler.lookup_rom("ngc", files)
+
+    assert mock_request.call_args.kwargs["data"] == [{"mD5": "md5one"}]
+
+
+@patch.object(meta_hasheous_handler, "_request", new_callable=AsyncMock)
+@patch.object(meta_hasheous_handler, "is_enabled", return_value=True)
+async def test_lookup_rom_picks_the_largest_file_allowed_for_the_platform(
+    mock_is_enabled, mock_request
+):
+    """Dreamcast restricts the lookup to bin/chd/cue, so a larger .gdi in the
+    same folder must not become the file we ask about."""
+    mock_request.return_value = {}
+
+    files = [
+        _top_level_rom_file(file_name="game.gdi", file_size_bytes=900, md5_hash="gdi"),
+        _top_level_rom_file(
+            file_name="track01.bin", file_size_bytes=800, md5_hash="bin"
+        ),
+        _top_level_rom_file(file_name="game.cue", file_size_bytes=100, md5_hash="cue"),
+    ]
+
+    await meta_hasheous_handler.lookup_rom("dc", files)
+
+    assert mock_request.call_args.kwargs["data"] == [{"mD5": "bin"}]
+
+
+@patch.object(meta_hasheous_handler, "_request", new_callable=AsyncMock)
+@patch.object(meta_hasheous_handler, "is_enabled", return_value=True)
+async def test_lookup_rom_is_inconclusive_when_every_file_is_filtered_out(
+    mock_is_enabled, mock_request
+):
+    """Asking nothing says nothing about the ROM. Reporting it as conclusive
+    would let a rescan clear a Hasheous match the ROM legitimately earned."""
+    files = [
+        _top_level_rom_file(file_name="game.gdi", file_size_bytes=900, md5_hash="gdi")
+    ]
+
+    result, conclusive = await meta_hasheous_handler.lookup_rom("dc", files)
+
+    assert result["hasheous_id"] is None
+    assert conclusive is False
+    mock_request.assert_not_called()
 
 
 @patch.object(meta_hasheous_handler, "_request", new_callable=AsyncMock)
